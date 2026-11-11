@@ -13,8 +13,9 @@ name: Publish a release
 # That repository builds and tests the binaries and the unsigned packages; it holds no publishing
 # secret any more (#965 S6 there).
 #
-#   stage    environment `stage`: only a READ-ONLY token on the private repository, no signing
-#            secret. Finds the successful "CLI — release" run of tag cli-v<version>, downloads its
+#   stage    environment `stage`: a GitHub App installed on the private repository only, with
+#            Contents and Actions read; its token lives one hour and is revoked at the end of the
+#            job. No signing secret. Finds the successful "CLI — release" run of tag cli-v<version>, downloads its
 #            artifact, checks every checksum and that the binary says the commit of the tag, then
 #            computes which versions each channel serves and renders the Homebrew formulae with
 #            the rules of the private repository at that same tag (channels.ts, homebrew.ts).
@@ -67,18 +68,31 @@ jobs:
             echo "::error::v${VERSION} already exists in ${GITHUB_REPOSITORY}"; exit 1
           fi
 
+      # A read-only GitHub App installed on the private repository only. The token is minted
+      # here, given only to the two steps that read the private repository (never to the npm
+      # install below), and revoked by the action at the end of the job.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: private
+        with:
+          app-id: ${{ vars.SKOPEA_STAGE_APP_ID }}
+          private-key: ${{ secrets.SKOPEA_STAGE_APP_PRIVATE_KEY }}
+          owner: KamorionLabs
+          repositories: dashborion
+          permission-contents: read
+          permission-actions: read
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: KamorionLabs/dashborion
           ref: cli-v${{ inputs.version }}
-          token: ${{ secrets.DASHBORION_READ_TOKEN }}
+          token: ${{ steps.private.outputs.token }}
           path: src
           persist-credentials: false
 
       - name: Download the artifact of the successful release run of the tag
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DASHBORION_READ_TOKEN }}
+          GH_TOKEN: ${{ steps.private.outputs.token }}
         run: |
           set -euo pipefail
           run_id="$(gh run list --repo "$PRIVATE_REPO" --workflow cli-release.yml --branch "cli-v${VERSION}" \

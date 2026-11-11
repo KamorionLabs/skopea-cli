@@ -20,7 +20,7 @@ Signing and publishing happen **here only**, in the workflow
 
 | Environment | Protection | Secrets and variables |
 |---|---|---|
-| `stage` | none | secret `DASHBORION_READ_TOKEN`: read-only access (contents, actions) to the private repository |
+| `stage` | deployments from `main` only | variable `SKOPEA_STAGE_APP_ID`, secret `SKOPEA_STAGE_APP_PRIVATE_KEY`: a GitHub App with Contents and Actions **read**, installed on the private repository only. The job mints a one-hour token, revoked at the end of the job |
 | `packages` | required reviewer, deployments from `main` only | secrets `SKOPEA_PACKAGES_GPG_PRIVATE_KEY` (the signing subkey only), `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `SKOPEA_RELEASE_APP_PRIVATE_KEY`; variables `R2_ACCOUNT_ID`, `SKOPEA_PACKAGES_BUCKET`, `SKOPEA_RELEASE_APP_ID` |
 
 The `publish` job installs no npm package and runs only this repository's scripts
