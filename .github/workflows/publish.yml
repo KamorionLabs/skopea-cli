@@ -1,0 +1,397 @@
+name: Publish a release
+
+# Publishes one version of the `skopea` terminal: the GitHub release of this repository, the apt
+# and dnf repositories on packages.skopea.io, the install script, the Homebrew tap and the front
+# page of this repository.
+#
+#   Actions > "Publish a release" > Run workflow, version = 0.1.0-preview.10
+#
+# The packages signing key, the R2 keys and the Homebrew tap credential live HERE and nowhere
+# else, in the environment `packages`: it requires an approval and deploys from `main` only. Both
+# protections are free on a public repository and impossible on the private one where the
+# terminal is built (its plan offers neither environments nor reviewers on a private repository).
+# That repository builds and tests the binaries and the unsigned packages; it holds no publishing
+# secret any more (#965 S6 there).
+#
+#   stage    environment `stage`: only a READ-ONLY token on the private repository, no signing
+#            secret. Finds the successful "CLI — release" run of tag cli-v<version>, downloads its
+#            artifact, checks every checksum and that the binary says the commit of the tag, then
+#            computes which versions each channel serves and renders the Homebrew formulae with
+#            the rules of the private repository at that same tag (channels.ts, homebrew.ts).
+#   publish  environment `packages` (approval required). Signs the rpms, creates the release,
+#            rebuilds the signed apt and dnf trees with THIS repository's packaging/build-repos.sh,
+#            uploads them, updates the tap and the front page. It installs no package from npm
+#            and runs no script that came from the private repository: what it receives from
+#            `stage` is data (binaries, packages, plan, formulae, front-page files), checked here.
+#   verify   installs from the public channels.
+#
+# Publishing is the approval of the `publish` job: the reviewer sees the version and the commit
+# printed by `stage` before approving. The private run's artifact lives 30 days.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without the v), e.g. 0.1.0-preview.10"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  PRIVATE_REPO: KamorionLabs/dashborion
+  TAP_REPO: KamorionLabs/homebrew-tap
+  PACKAGES_URL: https://packages.skopea.io
+
+jobs:
+  stage:
+    name: Stage the build of tag cli-v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    environment: stage
+    steps:
+      - name: A version, not yet published here
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "::error::not a release version: $VERSION"; exit 1; }
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::v${VERSION} already exists in ${GITHUB_REPOSITORY}"; exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: KamorionLabs/dashborion
+          ref: cli-v${{ inputs.version }}
+          token: ${{ secrets.DASHBORION_READ_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - name: Download the artifact of the successful release run of the tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DASHBORION_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list --repo "$PRIVATE_REPO" --workflow cli-release.yml --branch "cli-v${VERSION}" \
+            --event push --status success --limit 1 --json databaseId -q '.[0].databaseId')"
+          [ -n "$run_id" ] || { echo "::error::no successful 'CLI — release' run for tag cli-v${VERSION}"; exit 1; }
+          gh run download "$run_id" --repo "$PRIVATE_REPO" --name "skopea-cli-${VERSION}" --dir release
+          echo "run https://github.com/${PRIVATE_REPO}/actions/runs/${run_id}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Every checksum holds, and the binary says the commit of the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git -C src rev-parse HEAD)"
+          cd release
+          sha256sum -c SHA256SUMS
+          chmod +x skopea-linux-x64
+          ./skopea-linux-x64 version -o json > "$RUNNER_TEMP/version.json"
+          jq -e --arg v "$VERSION" --arg c "$commit" '.version == $v and .build.sha == $c' "$RUNNER_TEMP/version.json" > /dev/null \
+            || { echo "::error::the binary is not ${VERSION} built from ${commit}"; cat "$RUNNER_TEMP/version.json"; exit 1; }
+          {
+            echo "### skopea ${VERSION}"
+            echo "built from \`${commit}\` (${PRIVATE_REPO}, tag cli-v${VERSION})"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          package_json_file: src/package.json
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
+      # This job holds no signing secret: installing npm packages here is what the split is for.
+      - name: Install the terminal's workspace dependencies (bun)
+        working-directory: src
+        run: pnpm install --frozen-lockfile --filter @skopea/cli...
+
+      - name: The channels each served version lands on, and the Homebrew formulae
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: src/packages/cli
+        run: |
+          set -euo pipefail
+          bun=./node_modules/.bin/bun
+          mkdir -p "$GITHUB_WORKSPACE/plan/Formula" "$GITHUB_WORKSPACE/plan/front"
+          mapfile -t published < <(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 100 \
+            --json tagName -q '.[].tagName' | sed -n 's/^v\([0-9]\)/\1/p')
+          plan="$GITHUB_WORKSPACE/plan/plan.json"
+          "$bun" scripts/release/channels.ts plan "${published[@]}" "$VERSION" > "$plan"
+          jq . "$plan"
+          jq -e --arg v "$VERSION" '[.[][]] | index($v) != null' "$plan" > /dev/null \
+            || { echo "::error::${VERSION} is older than every version its channels keep: nothing to publish"; exit 1; }
+          for channel in stable preview; do
+            newest="$(jq -r --arg c "$channel" '.[$c][0] // empty' "$plan")"
+            if [ -z "$newest" ]; then echo "no $channel version yet: no formula"; continue; fi
+            if [ "$newest" = "$VERSION" ]; then
+              sums="$GITHUB_WORKSPACE/release/SHA256SUMS"
+            else
+              sums="$RUNNER_TEMP/sums/$newest/SHA256SUMS"
+              [ -f "$sums" ] || gh release download "v${newest}" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$(dirname "$sums")"
+            fi
+            name="$([ "$channel" = stable ] && echo skopea || echo skopea-preview)"
+            flags=(); if [ -n "$(jq -r '.stable[0] // empty' "$plan")" ]; then flags+=(--stable-exists); fi
+            "$bun" scripts/release/homebrew.ts --channel "$channel" --version "$newest" \
+              --repo "$GITHUB_REPOSITORY" --sums "$sums" "${flags[@]}" > "$GITHUB_WORKSPACE/plan/Formula/${name}.rb"
+            echo "Formula/${name}.rb -> ${newest}"
+          done
+          # The front page and the install script, as the private repository writes them at the tag.
+          cp packaging/public/README.md "$GITHUB_WORKSPACE/plan/front/README.md"
+          cp packaging/LICENSE.md packaging/install.sh "$GITHUB_WORKSPACE/plan/front/"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: staged-release
+          path: release/
+          if-no-files-found: error
+          retention-days: 1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: channels-plan
+          path: plan/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Sign and publish ${{ inputs.version }}
+    needs: stage
+    runs-on: ubuntu-latest
+    environment: packages
+    permissions:
+      contents: write
+    env:
+      # Cloudflare R2 speaks S3 but not the checksums recent AWS CLIs send by default.
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+      AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+      R2_ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ vars.SKOPEA_PACKAGES_BUCKET }}
+    steps:
+      # This repository's scripts, at the commit being run (main only: environment rule).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: staged-release
+          path: release
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: channels-plan
+          path: plan
+
+      - name: Check what the stage job handed over (data only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -c SHA256SUMS --quiet)
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          jq -e --arg re "$semver" --arg v "$VERSION" '
+            (keys - ["stable", "preview"] | length == 0)
+            and ([.[][]] | all(type == "string" and test($re)))
+            and ([.[][]] | index($v) != null)' plan/plan.json > /dev/null \
+            || { echo "::error::plan.json is not a channels plan naming ${VERSION}"; exit 1; }
+          for file in plan/Formula/*; do
+            case "$(basename "$file")" in skopea.rb|skopea-preview.rb) ;; *) echo "::error::unexpected $file"; exit 1 ;; esac
+          done
+          for file in plan/front/*; do
+            case "$(basename "$file")" in README.md|LICENSE.md|install.sh) ;; *) echo "::error::unexpected $file"; exit 1 ;; esac
+          done
+
+      - name: Tools and signing key
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.SKOPEA_PACKAGES_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils createrepo-c rpm > /dev/null
+          [ -n "$SIGNING_KEY" ] || { echo "::error::secret SKOPEA_PACKAGES_GPG_PRIVATE_KEY is not set (environment packages)"; exit 1; }
+          printf '%s\n' "$SIGNING_KEY" | gpg --batch --import
+          fingerprint="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')"
+          echo "SKOPEA_GPG_KEY_ID=$fingerprint" >> "$GITHUB_ENV"
+          echo "signing with $fingerprint"
+
+      - name: Sign the rpms, check the signatures, rewrite SHA256SUMS
+        shell: bash
+        working-directory: release
+        run: |
+          set -euo pipefail
+          for rpm in ./*.rpm; do
+            rpmsign --define "_gpg_name ${SKOPEA_GPG_KEY_ID}" \
+              --define "_gpg_sign_cmd_extra_args --batch --pinentry-mode loopback" --addsign "$rpm"
+          done
+          gpg --batch --armor --export "$SKOPEA_GPG_KEY_ID" > "$RUNNER_TEMP/public.asc"
+          rpmdb="$RUNNER_TEMP/rpmdb"; mkdir -p "$rpmdb"
+          rpmkeys --dbpath "$rpmdb" --import "$RUNNER_TEMP/public.asc"
+          for rpm in ./*.rpm; do
+            rpmkeys --dbpath "$rpmdb" --checksig "$rpm" | grep -q 'signatures OK' \
+              || { echo "::error::$rpm is not signed by ${SKOPEA_GPG_KEY_ID}"; exit 1; }
+          done
+          sha256sum skopea-darwin-arm64 skopea-darwin-x64 skopea-linux-x64 skopea-linux-arm64 \
+            ./*.deb ./*.rpm LICENSE.md THIRD_PARTY_NOTICES.txt | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release with every file and SHA256SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: release
+        run: |
+          set -euo pipefail
+          channels="$(jq -r --arg v "$VERSION" '[to_entries[] | select(.value | index($v) != null) | .key] | join(", ")' ../plan/plan.json)"
+          prerelease=false; [[ "$VERSION" == *-* ]] && prerelease=true
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Skopea terminal ${VERSION} (${channels} channel).
+
+          Install with Homebrew, apt, dnf or the install script: see the [README](https://github.com/${GITHUB_REPOSITORY}#install).
+          Every file is listed in \`SHA256SUMS\`; \`skopea version\` prints the commit the binary was built from.
+          The rpms, the apt repository and the dnf metadata are signed with the key under [Signing key](https://github.com/${GITHUB_REPOSITORY}#signing-key).
+
+          | Platform | Binary | Package |
+          |---|---|---|
+          | macOS, Apple silicon | \`skopea-darwin-arm64\` | |
+          | macOS, Intel | \`skopea-darwin-x64\` | |
+          | Linux x86-64 (glibc) | \`skopea-linux-x64\` | \`skopea_${VERSION}_amd64.deb\`, \`skopea-${VERSION}.x86_64.rpm\` |
+          | Linux arm64 (glibc) | \`skopea-linux-arm64\` | \`skopea_${VERSION}_arm64.deb\`, \`skopea-${VERSION}.aarch64.rpm\` |
+          EOF
+          flags=(--target main --title "Skopea terminal ${VERSION}" --notes-file "$RUNNER_TEMP/notes.md")
+          if [ "$prerelease" = true ]; then flags+=(--prerelease); fi
+          files=(skopea-darwin-arm64 skopea-darwin-x64 skopea-linux-x64 skopea-linux-arm64 ./*.deb ./*.rpm LICENSE.md THIRD_PARTY_NOTICES.txt SHA256SUMS)
+          gh release create "v${VERSION}" --repo "$GITHUB_REPOSITORY" "${flags[@]}" "${files[@]}"
+
+      - name: Download and verify the packages of every version served
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for version in $(jq -r '[.[][]] | unique | .[]' plan/plan.json); do
+            gh release download "v${version}" --repo "$GITHUB_REPOSITORY" --dir "pk/${version}" \
+              --pattern '*.deb' --pattern '*.rpm' --pattern SHA256SUMS
+            (cd "pk/${version}" && sha256sum -c SHA256SUMS --ignore-missing --quiet)
+            for file in "pk/${version}"/*.deb "pk/${version}"/*.rpm; do
+              [ -e "$file" ] || continue
+              grep -q " $(basename "$file")\$" "pk/${version}/SHA256SUMS" || { echo "::error::$file is not in SHA256SUMS"; exit 1; }
+            done
+          done
+
+      - name: Build the signed apt and dnf repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/build-repos.sh pk plan/plan.json out "$PACKAGES_URL"
+          cp plan/front/install.sh out/install.sh
+
+      # Packages first, then the metadata that names them, then the deletion of what no index
+      # names any more: a client never reads an index pointing at a file not yet uploaded.
+      - name: Upload to the packages bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          s3() { aws s3 "$@" --endpoint-url "$R2_ENDPOINT" --only-show-errors; }
+          s3 sync out/ "s3://${BUCKET}/" --exclude '*' --include '*.deb' --include '*.rpm' \
+            --cache-control 'public, max-age=31536000, immutable'
+          s3 sync out/ "s3://${BUCKET}/" --exclude '*.deb' --exclude '*.rpm' \
+            --cache-control 'public, max-age=60'
+          s3 sync out/ "s3://${BUCKET}/" --delete --size-only
+
+      # A GitHub App installed on the tap only.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app
+        with:
+          app-id: ${{ vars.SKOPEA_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SKOPEA_RELEASE_APP_PRIVATE_KEY }}
+          owner: KamorionLabs
+          repositories: homebrew-tap
+          permission-contents: write
+
+      - name: Update the Homebrew tap and this repository's front page
+        shell: bash
+        env:
+          TAP_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          push_if_changed() { # <dir> <message>
+            git -C "$1" add -A
+            if git -C "$1" diff --cached --quiet; then echo "$1: unchanged"; return; fi
+            git -C "$1" -c user.name="skopea-release[bot]" -c user.email="skopea-release[bot]@users.noreply.github.com" \
+              commit -q -m "$2"
+            git -C "$1" push -q origin HEAD
+            echo "$1: pushed"
+          }
+          git clone -q --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp plan/Formula/*.rb tap/Formula/
+          push_if_changed tap "skopea ${VERSION}"
+
+          git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" front
+          sed "s/{{SIGNING_KEY_FINGERPRINT}}/${SKOPEA_GPG_KEY_ID}/" plan/front/README.md > front/README.md
+          cp plan/front/LICENSE.md front/LICENSE.md
+          cp plan/front/install.sh front/install.sh
+          push_if_changed front "Release ${VERSION}"
+
+  verify:
+    name: Install from the public channels
+    needs: [stage, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: channels-plan
+          path: plan
+
+      # The metadata is cached 60 s at the edge: retry for a few minutes before calling it broken.
+      - name: apt, dnf and the install script serve the newest version of each channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > check.sh <<'EOF'
+          set -eu
+          skopea version -o json > /tmp/version.json
+          grep -q "\"version\": \"$1\"" /tmp/version.json || { cat /tmp/version.json; exit 1; }
+          EOF
+          retry() { for attempt in 1 2 3 4 5 6; do "$@" && return 0; echo "attempt $attempt failed, retrying in 30 s"; sleep 30; done; return 1; }
+          for channel in stable preview; do
+            newest="$(jq -r --arg c "$channel" '.[$c][0] // empty' plan/plan.json)"
+            [ -n "$newest" ] || continue
+            repo="$([ "$channel" = stable ] && echo skopea || echo skopea-preview)"
+            echo "== $channel -> $newest"
+            retry docker run --rm -v "$PWD/check.sh:/check.sh:ro" ubuntu:24.04 sh -ec "
+              apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null
+              install -d -m 0755 /etc/apt/keyrings
+              curl -fsSL ${PACKAGES_URL}/gpg.key -o /etc/apt/keyrings/skopea.asc
+              printf 'Types: deb\nURIs: ${PACKAGES_URL}/apt\nSuites: ${channel}\nComponents: main\nSigned-By: /etc/apt/keyrings/skopea.asc\n' > /etc/apt/sources.list.d/skopea.sources
+              apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq skopea > /dev/null
+              sh /check.sh ${newest}"
+            retry docker run --rm -v "$PWD/check.sh:/check.sh:ro" fedora:42 sh -ec "
+              curl -fsSL ${PACKAGES_URL}/rpm/${repo}.repo -o /etc/yum.repos.d/${repo}.repo
+              dnf install -y -q skopea > /dev/null
+              sh /check.sh ${newest}"
+            retry docker run --rm -v "$PWD/check.sh:/check.sh:ro" ubuntu:24.04 sh -ec "
+              apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null
+              curl -fsSL ${PACKAGES_URL}/install.sh | sh -s -- --channel ${channel} --dir /usr/local/bin
+              sh /check.sh ${newest}"
+          done
