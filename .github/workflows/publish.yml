@@ -46,7 +46,7 @@ concurrency:
 
 env:
   VERSION: ${{ inputs.version }}
-  PRIVATE_REPO: KamorionLabs/dashborion
+  PRIVATE_REPO: KamorionLabs/skopea
   TAP_REPO: KamorionLabs/homebrew-tap
   PACKAGES_URL: https://packages.skopea.io
 
@@ -77,13 +77,13 @@ jobs:
           app-id: ${{ vars.SKOPEA_STAGE_APP_ID }}
           private-key: ${{ secrets.SKOPEA_STAGE_APP_PRIVATE_KEY }}
           owner: KamorionLabs
-          repositories: dashborion
+          repositories: skopea
           permission-contents: read
           permission-actions: read
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: KamorionLabs/dashborion
+          repository: KamorionLabs/skopea
           ref: cli-v${{ inputs.version }}
           token: ${{ steps.private.outputs.token }}
           path: src
